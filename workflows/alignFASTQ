@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import pandas as pd
+import glob
+import shutil
+import os
+
+##### Load config and sample sheets #####
+configfile: "config/config.yaml"
+
+## Read in samplesheet
+samples = pd.read_csv(config["samplesheet"], sep='\t')
+
+## Convert all columns to strings
+samples = samples.astype(str)
+
+## Concatenate the sequencing directory to Read1 and Read2 for full paths
+samples['Read1'] = samples[['Sequencing_Directory', 'Read1']].apply(lambda row: os.path.join(*row), axis=1)
+samples['Read2'] = samples[['Sequencing_Directory', 'Read2']].apply(lambda row: os.path.join(*row), axis=1)
+
+## Concatenate columns to identify which groups to run (i.e. Seq_Rep will be run together)
+samples['id'] = samples[config['mergeBy']].agg('_'.join, axis=1)
+
+## Group by id and extract Read1 & Read2
+read1 = samples.groupby('id')['Read1'].apply(list).to_dict()
+read2 = samples.groupby('id')['Read2'].apply(list).to_dict()
+
+## Define actions on success
+onsuccess:
+    print("alignFASTQ completed successfully!")
+
+##### Define rules #####
+rule all:
+    input:
+        [expand("output/{group}/{group}_{ext}", group=key, ext=['qc_summary.txt', 'libraryComplexity.txt', 'contact_map.hic']) for key in samples['id']]
+
+## Alignment
+rule align:
+    input:
+        R1 = lambda wildcards: read1.get(wildcards.group),
+        R2 = lambda wildcards: read2.get(wildcards.group)
+    output:
+        sam = temp("output/{group}/{group}_aligned.sam")
+    log:
+        err = "output/{group}/logs/{group}_align.err"
+    threads: 16
+    params:
+        fasta = config['fasta']
+    benchmark: 
+        "output/{group}/benchmarks/{group}_align.tsv"
+    shell:
+        "module load bwa; "
+        "bwa mem -5SP -T0 -t {threads} {params.fasta} <(zcat {input.R1}) <(zcat {input.R2}) > {output.sam} 2> {log.err}"
+
+## Recording valid ligation events
+rule parse:
+    input:
+        sam = rules.align.output.sam
+    output:
+        pairsam = temp("output/{group}/{group}_parsed.pairsam")
+    log:
+        err = "output/{group}/logs/{group}_parse.err"
+    threads: 16
+    params:
+        chromSizes = config['chromSizes']
+    benchmark: 
+        "output/{group}/benchmarks/{group}_parse.tsv"
+    shell:
+        """
+        module load pairtools
+        pairtools parse --min-mapq 40 --walks-policy 5unique --max-inter-align-gap 30 --nproc-in {threads} \
+        --nproc-out {threads} --chroms-path {params.chromSizes} {input.sam} > {output.pairsam}
+        """
+
+## Sorting the pairsam files
+rule sort_pairsam:
+    input:
+        pairsam = rules.parse.output.pairsam
+    output:
+        sorted_pairsam = temp("output/{group}/{group}_sorted.pairsam")
+    log:
+        err = "output/{group}/logs/{group}_sort_pairsam.err"
+    threads: 16
+    benchmark: 
+        "output/{group}/benchmarks/{group}_sort_pairsam.tsv"
+    shell:
+        """
+        tmpdir=$(mktemp -d -p $PWD/output/{wildcards.group})
+        module load pairtools
+        pairtools sort --nproc {threads} --tmpdir=$tmpdir {input.pairsam} > {output.sorted_pairsam}
+        rm -rf $tmpdir
+        """
+
+## Removing PCR duplicates
+rule dedup:
+    input:
+        sorted_pairsam = rules.sort_pairsam.output.sorted_pairsam
+    output:
+        stats = temp("output/{group}/{group}_dedup_stats.txt"),
+        dedup_pairsam = temp("output/{group}/{group}_dedup.pairsam")
+    log:
+        err = "output/{group}/logs/{group}_dedup.err"
+    threads: 16
+    benchmark: 
+        "output/{group}/benchmarks/{group}_dedup.tsv"
+    shell:
+        """
+        module load pairtools
+        pairtools dedup --nproc-in {threads} --nproc-out {threads} --mark-dups --output-stats {output.stats} \
+        --output {output.dedup_pairsam} {input.sorted_pairsam}
+        """
+
+## Generate .pairs and .bam files
+rule pairs:
+    input:
+        dedup_pairsam = rules.dedup.output.dedup_pairsam
+    output:
+        mapped_pairs = temp("output/{group}/{group}_mapped.pairs"),
+        unsorted_bam = temp("output/{group}/{group}_unsorted.bam")
+    log:
+        err = "output/{group}/logs/{group}_pairs.err"
+    threads: 16
+    benchmark: 
+        "output/{group}/benchmarks/{group}_pairs.tsv"
+    shell:
+        """
+        module load pairtools
+        pairtools split --nproc-in {threads} --nproc-out {threads} --output-pairs {output.mapped_pairs} \
+        --output-sam {output.unsorted_bam} {input.dedup_pairsam}
+        """
+
+## Sort and index the final bam file
+rule sort_bam:
+    input:
+        unsorted_bam = rules.pairs.output.unsorted_bam
+    output:
+        mapped_bam = "output/{group}/{group}_mapped.PT.bam",
+        indexed_bam = "output/{group}/{group}_mapped.PT.bam.bai"
+    log:
+        err = "output/{group}/logs/{group}_sort_bam.err"
+    threads: 16
+    benchmark: 
+        "output/{group}/benchmarks/{group}_sort_bam.tsv"
+    shell:
+        """
+        tmpfile=$(mktemp -p $PWD/output/{wildcards.group} --suffix=.bam)
+        module load samtools
+        samtools sort -@{threads} -T $tmpfile -o {output.mapped_bam} {input.unsorted_bam}
+        samtools index {output.mapped_bam}
+        rm -rf $tmpfile
+        """
+
+## QC and library complexity
+rule qc:
+    input:
+        stats = rules.dedup.output.stats,
+        mapped_bam = rules.sort_bam.output.mapped_bam,
+        indexed_bam = rules.sort_bam.output.indexed_bam
+    output:
+        qc_summary = "output/{group}/{group}_qc_summary.txt",
+        lib_complexity = "output/{group}/{group}_libraryComplexity.txt"
+    log:
+        err = "output/{group}/logs/{group}_qc.err"
+    threads: 1
+    benchmark: 
+        "output/{group}/benchmarks/{group}_qc.tsv"
+    shell:
+        """
+        ## QC
+        module load python/3.6.6
+        python3 ./scripts/get_qc.py -p {input.stats} > {output.qc_summary}
+
+        ## Library complexity
+        module load preseq
+        preseq lc_extrap -bam -pe -extrap 2.1e9 -step 1e8 -seg_len 1000000000 \
+        -output {output.lib_complexity} {input.mapped_bam}
+        """
+
+## Generate hic file (one-step)
+rule hic:
+    input:
+        mapped_pairs = rules.pairs.output.mapped_pairs
+    output:
+        hic = "output/{group}/{group}_contact_map.hic"
+    log:
+        err = "output/{group}/logs/{group}_hic.err"
+    threads: 16
+    params:
+        chromSizes = config['chromSizes']
+    benchmark: 
+        "output/{group}/benchmarks/{group}_hic.tsv"
+    shell:
+        """
+        java -Xmx48000m -Djava.awt.headless=true -jar ./scripts/juicer_tools_1.22.01.jar pre \
+        --threads {threads} {input.mapped_pairs} {output.hic} {params.chromSizes}
+        """
